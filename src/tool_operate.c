@@ -451,6 +451,7 @@ static CURLcode post_per_transfer(struct GlobalConfig *global,
        (CURLE_FTP_ACCEPT_TIMEOUT == result))
       /* retry timeout always */
       retry = RETRY_TIMEOUT;
+      oserrno = 0;
     else if(config->retry_connrefused &&
             (CURLE_COULDNT_CONNECT == result)) {
       long oserrno;
