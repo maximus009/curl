@@ -437,6 +437,7 @@ static CURLcode post_per_transfer(struct GlobalConfig *global,
        config->retry_maxtime*1000L)) ) {
     enum {
       RETRY_NO,
+      RETRY_ALL_ERRORS,
       RETRY_TIMEOUT,
       RETRY_CONNREFUSED,
       RETRY_HTTP,
@@ -506,11 +507,15 @@ static CURLcode post_per_transfer(struct GlobalConfig *global,
         retry = RETRY_FTP;
     }
 
+    if(result && !retry && config->retry_all_errors)
+      retry = RETRY_ALL_ERRORS;
+
     if(retry) {
       long sleeptime = 0;
       curl_off_t retry_after = 0;
       static const char * const m[]={
         NULL,
+        "(retrying all errors)",
         "timeout",
         "connection refused",
         "HTTP error",
@@ -694,7 +699,7 @@ static CURLcode single_transfer(struct GlobalConfig *global,
 {
   CURLcode result = CURLE_OK;
   struct getout *urlnode;
-  metalinkfile *mlfile_last = NULL;
+  struct metalinkfile *mlfile_last = NULL;
   bool orig_noprogress = global->noprogress;
   bool orig_isatty = global->isatty;
   struct State *state = &config->state;
@@ -735,10 +740,10 @@ static CURLcode single_transfer(struct GlobalConfig *global,
 
   while(config->state.urlnode) {
     char *infiles; /* might be a glob pattern */
-    URLGlob *inglob = state->inglob;
+    struct URLGlob *inglob = state->inglob;
     bool metalink = FALSE; /* metalink download? */
-    metalinkfile *mlfile;
-    metalink_resource *mlres;
+    struct metalinkfile *mlfile;
+    struct metalink_resource *mlres;
 
     urlnode = config->state.urlnode;
     if(urlnode->flags & GETOUT_METALINK) {
@@ -905,35 +910,6 @@ static CURLcode single_transfer(struct GlobalConfig *global,
         /* default output stream is stdout */
         outs->stream = stdout;
 
-        /* --etag-save */
-        etag_save = &per->etag_save;
-        etag_save->stream = stdout;
-
-        if(config->etag_save_file) {
-          /* open file for output: */
-          if(strcmp(config->etag_save_file, "-")) {
-            FILE *newfile = fopen(config->etag_save_file, "wb");
-            if(!newfile) {
-              warnf(
-                config->global,
-                "Failed to open %s\n", config->etag_save_file);
-
-              result = CURLE_WRITE_ERROR;
-              break;
-            }
-            else {
-              etag_save->filename = config->etag_save_file;
-              etag_save->s_isreg = TRUE;
-              etag_save->fopened = TRUE;
-              etag_save->stream = newfile;
-            }
-          }
-          else {
-            /* always use binary mode for protocol header output */
-            set_binmode(etag_save->stream);
-          }
-        }
-
         /* --etag-compare */
         if(config->etag_compare_file) {
           char *etag_from_file = NULL;
@@ -941,7 +917,7 @@ static CURLcode single_transfer(struct GlobalConfig *global,
 
           /* open file for reading: */
           FILE *file = fopen(config->etag_compare_file, FOPEN_READTEXT);
-          if(!file) {
+          if(!file && !config->etag_save_file) {
             errorf(config->global,
                    "Failed to open %s\n", config->etag_compare_file);
             result = CURLE_READ_ERROR;
@@ -972,6 +948,35 @@ static CURLcode single_transfer(struct GlobalConfig *global,
 
           if(file) {
             fclose(file);
+          }
+        }
+
+        /* --etag-save */
+        etag_save = &per->etag_save;
+        etag_save->stream = stdout;
+
+        if(config->etag_save_file) {
+          /* open file for output: */
+          if(strcmp(config->etag_save_file, "-")) {
+            FILE *newfile = fopen(config->etag_save_file, "wb");
+            if(!newfile) {
+              warnf(
+                config->global,
+                "Failed to open %s\n", config->etag_save_file);
+
+              result = CURLE_WRITE_ERROR;
+              break;
+            }
+            else {
+              etag_save->filename = config->etag_save_file;
+              etag_save->s_isreg = TRUE;
+              etag_save->fopened = TRUE;
+              etag_save->stream = newfile;
+            }
+          }
+          else {
+            /* always use binary mode for protocol header output */
+            set_binmode(etag_save->stream);
           }
         }
 
@@ -1551,11 +1556,90 @@ static CURLcode single_transfer(struct GlobalConfig *global,
             }
           }
 
+          /* In debug build of curl tool, using
+           *    --cert loadmem=<filename>:<password> --cert-type p12
+           *  must do the same thing than classic:
+           *    --cert <filename>:<password> --cert-type p12
+           *  but is designed to test blob */
+#if defined(CURLDEBUG) || defined(DEBUGBUILD)
+          if(config->cert && (strlen(config->cert) > 8) &&
+             (memcmp(config->cert, "loadmem=",8) == 0)) {
+            FILE *fInCert = fopen(config->cert + 8, "rb");
+            void *certdata = NULL;
+            long filesize = 0;
+            bool continue_reading = fInCert != NULL;
+            if(continue_reading)
+              continue_reading = fseek(fInCert, 0, SEEK_END) == 0;
+            if(continue_reading)
+              filesize = ftell(fInCert);
+            if(filesize < 0)
+              continue_reading = FALSE;
+            if(continue_reading)
+              continue_reading = fseek(fInCert, 0, SEEK_SET) == 0;
+            if(continue_reading)
+              certdata = malloc(((size_t)filesize) + 1);
+            if((!certdata) ||
+                ((int)fread(certdata, (size_t)filesize, 1, fInCert) != 1))
+              continue_reading = FALSE;
+            if(fInCert)
+              fclose(fInCert);
+            if((filesize > 0) && continue_reading) {
+              struct curl_blob structblob;
+              structblob.data = certdata;
+              structblob.len = (size_t)filesize;
+              structblob.flags = CURL_BLOB_COPY;
+              my_setopt_str(curl, CURLOPT_SSLCERT_BLOB, &structblob);
+              /* if test run well, we are sure we don't reuse
+               * original mem pointer */
+              memset(certdata, 0, (size_t)filesize);
+            }
+            free(certdata);
+          }
+          else
+#endif
           my_setopt_str(curl, CURLOPT_SSLCERT, config->cert);
           my_setopt_str(curl, CURLOPT_PROXY_SSLCERT, config->proxy_cert);
           my_setopt_str(curl, CURLOPT_SSLCERTTYPE, config->cert_type);
           my_setopt_str(curl, CURLOPT_PROXY_SSLCERTTYPE,
                         config->proxy_cert_type);
+
+
+#if defined(CURLDEBUG) || defined(DEBUGBUILD)
+          if(config->key && (strlen(config->key) > 8) &&
+             (memcmp(config->key, "loadmem=",8) == 0)) {
+            FILE *fInCert = fopen(config->key + 8, "rb");
+            void *certdata = NULL;
+            long filesize = 0;
+            bool continue_reading = fInCert != NULL;
+            if(continue_reading)
+              continue_reading = fseek(fInCert, 0, SEEK_END) == 0;
+            if(continue_reading)
+              filesize = ftell(fInCert);
+            if(filesize < 0)
+              continue_reading = FALSE;
+            if(continue_reading)
+              continue_reading = fseek(fInCert, 0, SEEK_SET) == 0;
+            if(continue_reading)
+              certdata = malloc(((size_t)filesize) + 1);
+            if((!certdata) ||
+                ((int)fread(certdata, (size_t)filesize, 1, fInCert) != 1))
+              continue_reading = FALSE;
+            if(fInCert)
+              fclose(fInCert);
+            if((filesize > 0) && continue_reading) {
+              struct curl_blob structblob;
+              structblob.data = certdata;
+              structblob.len = (size_t)filesize;
+              structblob.flags = CURL_BLOB_COPY;
+              my_setopt_str(curl, CURLOPT_SSLKEY_BLOB, &structblob);
+              /* if test run well, we are sure we don't reuse
+               * original mem pointer */
+              memset(certdata, 0, (size_t)filesize);
+            }
+            free(certdata);
+          }
+          else
+#endif
           my_setopt_str(curl, CURLOPT_SSLKEY, config->key);
           my_setopt_str(curl, CURLOPT_PROXY_SSLKEY, config->proxy_key);
           my_setopt_str(curl, CURLOPT_SSLKEYTYPE, config->key_type);
@@ -1589,7 +1673,25 @@ static CURLcode single_transfer(struct GlobalConfig *global,
                          config->ssl_version | config->ssl_version_max);
           my_setopt_enum(curl, CURLOPT_PROXY_SSLVERSION,
                          config->proxy_ssl_version);
+
+          {
+            long mask =
+              (config->ssl_allow_beast ? CURLSSLOPT_ALLOW_BEAST : 0) |
+              (config->ssl_revoke_best_effort ?
+               CURLSSLOPT_REVOKE_BEST_EFFORT : 0) |
+              (config->native_ca_store ?
+               CURLSSLOPT_NATIVE_CA : 0) |
+              (config->ssl_no_revoke ? CURLSSLOPT_NO_REVOKE : 0);
+
+            if(mask)
+              my_setopt_bitmask(curl, CURLOPT_SSL_OPTIONS, mask);
+          }
+
+          if(config->proxy_ssl_allow_beast)
+            my_setopt(curl, CURLOPT_PROXY_SSL_OPTIONS,
+                      (long)CURLSSLOPT_ALLOW_BEAST);
         }
+
         if(config->path_as_is)
           my_setopt(curl, CURLOPT_PATH_AS_IS, 1L);
 
@@ -1899,20 +2001,6 @@ static CURLcode single_transfer(struct GlobalConfig *global,
         if(config->gssapi_delegation)
           my_setopt_str(curl, CURLOPT_GSSAPI_DELEGATION,
                         config->gssapi_delegation);
-
-        /* new in 7.25.0, 7.44.0 and 7.70.0 */
-        {
-          long mask = (config->ssl_allow_beast ? CURLSSLOPT_ALLOW_BEAST : 0) |
-                      (config->ssl_revoke_best_effort ?
-                       CURLSSLOPT_REVOKE_BEST_EFFORT : 0) |
-                      (config->ssl_no_revoke ? CURLSSLOPT_NO_REVOKE : 0);
-          if(mask)
-            my_setopt_bitmask(curl, CURLOPT_SSL_OPTIONS, mask);
-        }
-
-        if(config->proxy_ssl_allow_beast)
-          my_setopt(curl, CURLOPT_PROXY_SSL_OPTIONS,
-                    (long)CURLSSLOPT_ALLOW_BEAST);
 
         if(config->mail_auth)
           my_setopt_str(curl, CURLOPT_MAIL_AUTH, config->mail_auth);
@@ -2332,6 +2420,14 @@ static CURLcode transfer_per_config(struct GlobalConfig *global,
       else {
         result = FindWin32CACert(config, tls_backend_info->backend,
                                  "curl-ca-bundle.crt");
+#if defined(USE_WIN32_CRYPTO)
+        if(!config->cacert && !config->capath) {
+          /* user, and environement did not specify any ca file or path
+             and there is no "curl-ca-bundle.crt" file in standard path
+             so the only possible solution is using the windows ca store */
+          config->native_ca_store = TRUE;
+        }
+#endif
       }
 #endif
     }
@@ -2410,6 +2506,7 @@ static CURLcode run_all_transfers(struct GlobalConfig *global,
 CURLcode operate(struct GlobalConfig *global, int argc, argv_item_t argv[])
 {
   CURLcode result = CURLE_OK;
+  char *first_arg = curlx_convert_tchar_to_UTF8(argv[1]);
 
   /* Setup proper locale from environment */
 #ifdef HAVE_SETLOCALE
@@ -2418,8 +2515,8 @@ CURLcode operate(struct GlobalConfig *global, int argc, argv_item_t argv[])
 
   /* Parse .curlrc if necessary */
   if((argc == 1) ||
-     (!curl_strequal(argv[1], "-q") &&
-      !curl_strequal(argv[1], "--disable"))) {
+     (!curl_strequal(first_arg, "-q") &&
+      !curl_strequal(first_arg, "--disable"))) {
     parseconfig(NULL, global); /* ignore possible failure */
 
     /* If we had no arguments then make sure a url was specified in .curlrc */
@@ -2428,6 +2525,8 @@ CURLcode operate(struct GlobalConfig *global, int argc, argv_item_t argv[])
       result = CURLE_FAILED_INIT;
     }
   }
+
+  curlx_unicodefree(first_arg);
 
   if(!result) {
     /* Parse the command line arguments */
