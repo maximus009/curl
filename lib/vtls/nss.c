@@ -101,10 +101,10 @@ struct ptr_list_wrap {
   struct curl_llist_element node;
 };
 
-typedef struct {
+struct cipher_s {
   const char *name;
   int num;
-} cipher_s;
+};
 
 #define PK11_SETATTRS(_attr, _idx, _type, _val, _len) do {  \
   CK_ATTRIBUTE *ptr = (_attr) + ((_idx)++);                 \
@@ -116,7 +116,7 @@ typedef struct {
 #define CERT_NewTempCertificate __CERT_NewTempCertificate
 
 #define NUM_OF_CIPHERS sizeof(cipherlist)/sizeof(cipherlist[0])
-static const cipher_s cipherlist[] = {
+static const struct cipher_s cipherlist[] = {
   /* SSL2 cipher suites */
   {"rc4",                        SSL_EN_RC4_128_WITH_MD5},
   {"rc4-md5",                    SSL_EN_RC4_128_WITH_MD5},
@@ -2374,6 +2374,9 @@ static CURLcode Curl_nss_md5sum(unsigned char *tmp, /* input */
   PK11Context *MD5pw = PK11_CreateDigestContext(SEC_OID_MD5);
   unsigned int MD5out;
 
+  if(!MD5pw)
+    return CURLE_NOT_BUILT_IN;
+
   PK11_DigestOp(MD5pw, tmp, curlx_uztoui(tmplen));
   PK11_DigestFinal(MD5pw, md5sum, &MD5out, curlx_uztoui(md5len));
   PK11_DestroyContext(MD5pw, PR_TRUE);
@@ -2388,6 +2391,9 @@ static CURLcode Curl_nss_sha256sum(const unsigned char *tmp, /* input */
 {
   PK11Context *SHA256pw = PK11_CreateDigestContext(SEC_OID_SHA256);
   unsigned int SHA256out;
+
+  if(!SHA256pw)
+    return CURLE_NOT_BUILT_IN;
 
   PK11_DigestOp(SHA256pw, tmp, curlx_uztoui(tmplen));
   PK11_DigestFinal(SHA256pw, sha256sum, &SHA256out, curlx_uztoui(sha256len));

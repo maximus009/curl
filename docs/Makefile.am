@@ -54,6 +54,7 @@ EXTRA_DIST =                                    \
  CONTRIBUTE.md                                  \
  CURL-DISABLE.md                                \
  DEPRECATE.md                                   \
+ DYNBUF.md                                      \
  ESNI.md                                        \
  EXPERIMENTAL.md                                \
  FAQ                                            \
@@ -71,6 +72,8 @@ EXTRA_DIST =                                    \
  KNOWN_BUGS                                     \
  LICENSE-MIXING.md                              \
  MAIL-ETIQUETTE                                 \
+ MQTT.md                                        \
+ options-in-versions                            \
  PARALLEL-TRANSFERS.md                          \
  README.md                                      \
  RELEASE-PROCEDURE.md                           \
@@ -82,7 +85,7 @@ EXTRA_DIST =                                    \
  THANKS                                         \
  TODO                                           \
  TheArtOfHttpScripting                          \
- VERSIONS
+ VERSIONS.md
 
 MAN2HTML= roffit $< >$@
 

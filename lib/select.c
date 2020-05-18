@@ -22,6 +22,8 @@
 
 #include "curl_setup.h"
 
+#include <limits.h>
+
 #ifdef HAVE_SYS_SELECT_H
 #include <sys/select.h>
 #elif defined(HAVE_UNISTD_H)
@@ -50,6 +52,7 @@
 #include "urldata.h"
 #include "connect.h"
 #include "select.h"
+#include "timeval.h"
 #include "warnless.h"
 
 /* Convenience local macros */
@@ -201,7 +204,7 @@ int Curl_select(curl_socket_t maxfd,
 int Curl_socket_check(curl_socket_t readfd0, /* two sockets to read from */
                       curl_socket_t readfd1,
                       curl_socket_t writefd, /* socket to write to */
-                      time_t timeout_ms)     /* milliseconds to wait */
+                      timediff_t timeout_ms)     /* milliseconds to wait */
 {
 #ifdef HAVE_POLL_FINE
   struct pollfd pfd[3];
@@ -216,10 +219,14 @@ int Curl_socket_check(curl_socket_t readfd0, /* two sockets to read from */
   int r;
   int ret;
 
-#if SIZEOF_TIME_T != SIZEOF_INT
-  /* wrap-around precaution */
-  if(timeout_ms >= INT_MAX)
+  /* prevent overflow. timeout_ms is typecast to time_t and int. */
+#if TIMEDIFF_T_MAX > INT_MAX
+  if(timeout_ms > INT_MAX)
     timeout_ms = INT_MAX;
+#endif
+#if INT_MAX > TIME_T_MAX
+  if(timeout_ms > (int)TIME_T_MAX)
+    timeout_ms = (int)TIME_T_MAX;
 #endif
 
   if((readfd0 == CURL_SOCKET_BAD) && (readfd1 == CURL_SOCKET_BAD) &&
@@ -333,7 +340,7 @@ int Curl_socket_check(curl_socket_t readfd0, /* two sockets to read from */
      curl_socket_t is unsigned in such cases and thus -1 is the largest
      value).
   */
-  r = Curl_select(maxfd, &fds_read, &fds_write, &fds_err, timeout_ms);
+  r = Curl_select(maxfd, &fds_read, &fds_write, &fds_err, (time_t)timeout_ms);
 
   if(r < 0)
     return -1;

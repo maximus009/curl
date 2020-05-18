@@ -49,6 +49,7 @@
 #define PORT_RTMPT PORT_HTTP
 #define PORT_RTMPS PORT_HTTPS
 #define PORT_GOPHER 70
+#define PORT_MQTT 1883
 
 #define DICT_MATCH "/MATCH:"
 #define DICT_MATCH2 "/M:"
@@ -103,6 +104,7 @@
 #include "hostip.h"
 #include "hash.h"
 #include "splay.h"
+#include "dynbuf.h"
 
 /* return the count of bytes sent, or -1 on error */
 typedef ssize_t (Curl_send)(struct connectdata *conn, /* connection data */
@@ -128,6 +130,7 @@ typedef ssize_t (Curl_recv)(struct connectdata *conn, /* connection data */
 #include "http.h"
 #include "rtsp.h"
 #include "smb.h"
+#include "mqtt.h"
 #include "wildcard.h"
 #include "multihandle.h"
 #include "quic.h"
@@ -149,10 +152,6 @@ typedef ssize_t (Curl_recv)(struct connectdata *conn, /* connection data */
 #include <libssh2.h>
 #include <libssh2_sftp.h>
 #endif /* HAVE_LIBSSH2_H */
-
-/* Initial size of the buffer to store headers in, it'll be enlarged in case
-   of need. */
-#define HEADERSIZE 256
 
 #define CURLEASY_MAGIC_NUMBER 0xc0dedbadU
 #define GOOD_EASY_HANDLE(x) \
@@ -241,11 +240,14 @@ struct ssl_config_data {
   long certverifyresult; /* result from the certificate verification */
   char *CRLfile;   /* CRL to check certificate revocation */
   char *issuercert;/* optional issuer certificate filename */
+  struct curl_blob *issuercert_blob;
   curl_ssl_ctx_callback fsslctx; /* function to initialize ssl ctx */
   void *fsslctxp;        /* parameter for call back */
   char *cert; /* client certificate file name */
+  struct curl_blob *cert_blob;
   char *cert_type; /* format for certificate (default: PEM)*/
   char *key; /* private key file name */
+  struct curl_blob *key_blob;
   char *key_type; /* format for private key (default: PEM) */
   char *key_passwd; /* plain text private key password */
 #ifdef USE_TLS_SRP
@@ -260,6 +262,7 @@ struct ssl_config_data {
   BIT(no_partialchain); /* don't accept partial certificate chains */
   BIT(revoke_best_effort); /* ignore SSL revocation offline/missing revocation
                               list errors */
+  BIT(native_ca_store); /* use the native ca store of operating system */
 };
 
 struct ssl_general_config {
@@ -554,18 +557,13 @@ enum doh_slots {
   DOH_PROBE_SLOTS
 };
 
-struct dohresponse {
-  unsigned char *memory;
-  size_t size;
-};
-
 /* one of these for each DoH request */
 struct dnsprobe {
   CURL *easy;
   int dnstype;
   unsigned char dohbuffer[512];
   size_t dohlen;
-  struct dohresponse serverdoh;
+  struct dynbuf serverdoh;
 };
 
 struct dohdata {
@@ -609,12 +607,7 @@ struct SingleRequest {
                                    written as body */
   int headerline;               /* counts header lines to better track the
                                    first one */
-  char *hbufp;                  /* points at *end* of header line */
-  size_t hbuflen;
   char *str;                    /* within buf */
-  char *str_start;              /* within buf */
-  char *end_ptr;                /* within buf */
-  char *p;                      /* within headerbuff */
   curl_off_t offset;            /* possible resume offset read from the
                                    Content-Range: header */
   int httpcode;                 /* error code from the 'HTTP/1.? XXX' or
@@ -623,8 +616,8 @@ struct SingleRequest {
   enum expect100 exp100;        /* expect 100 continue state */
   enum upgrade101 upgr101;      /* 101 upgrade state */
 
-  struct contenc_writer_s *writer_stack;  /* Content unencoding stack. */
-                                          /* See sec 3.5, RFC2616. */
+  /* Content unencoding stack. See sec 3.5, RFC2616. */
+  struct contenc_writer *writer_stack;
   time_t timeofdoc;
   long bodywrites;
   char *buf;
@@ -795,15 +788,10 @@ struct proxy_info {
   char *passwd;  /* proxy password string, allocated */
 };
 
-#define CONNECT_BUFFER_SIZE 16384
-
 /* struct for HTTP CONNECT state data */
 struct http_connect_state {
-  char connect_buffer[CONNECT_BUFFER_SIZE];
-  int perline; /* count bytes per line */
+  struct dynbuf rcvbuf;
   int keepon;
-  char *line_start;
-  char *ptr; /* where to store more data */
   curl_off_t cl; /* size of content to read and ignore */
   enum {
     TUNNEL_INIT,    /* init/default/no tunnel state */
@@ -890,8 +878,8 @@ struct connectdata {
   /* 'ip_addr' is the particular IP we connected to. It points to a struct
      within the DNS cache, so this pointer is only valid as long as the DNS
      cache entry remains locked. It gets unlocked in Curl_done() */
-  Curl_addrinfo *ip_addr;
-  Curl_addrinfo *tempaddr[2]; /* for happy eyeballs */
+  struct Curl_addrinfo *ip_addr;
+  struct Curl_addrinfo *tempaddr[2]; /* for happy eyeballs */
 
   /* 'ip_addr_str' is the ip_addr data as a human readable string.
      It remains available as long as the connection does, which is longer than
@@ -1081,6 +1069,7 @@ struct connectdata {
     struct smb_conn smbc;
     void *rtmp;
     struct ldapconninfo *ldapc;
+    struct mqtt_conn mqtt;
   } proto;
 
   int cselect_bits; /* bitmask of socket events */
@@ -1275,9 +1264,7 @@ struct Curl_http2_dep {
  * BODY).
  */
 struct tempbuf {
-  char *buf;  /* allocated buffer to keep data in when a write callback
-                 returns to make the connection paused */
-  size_t len; /* size of the 'tempwrite' allocated buffer */
+  struct dynbuf b;
   int type;   /* type of the 'tempwrite' buffer as a bitmask that is used with
                  Curl_client_write() */
 };
@@ -1330,7 +1317,6 @@ struct urlpieces {
 };
 
 struct UrlState {
-
   /* Points to the connection cache */
   struct conncache *conn_cache;
 
@@ -1338,9 +1324,7 @@ struct UrlState {
   struct curltime keeps_speed; /* for the progress meter really */
 
   struct connectdata *lastconnect; /* The last connection, NULL if undefined */
-
-  char *headerbuff; /* allocated buffer to store headers in */
-  size_t headersize;   /* size of the allocation */
+  struct dynbuf headerb; /* buffer to store headers in */
 
   char *buffer; /* download buffer */
   char *ulbuf; /* allocated upload buffer or NULL */
@@ -1420,8 +1404,8 @@ struct UrlState {
   struct urlpieces up;
 #ifndef CURL_DISABLE_HTTP
   size_t trailers_bytes_sent;
-  Curl_send_buffer *trailers_buf; /* a buffer containing the compiled trailing
-                                  headers */
+  struct dynbuf trailers_buf; /* a buffer containing the compiled trailing
+                                 headers */
 #endif
   trailers_state trailers_state; /* whether we are sending trailers
                                        and what stage are we at */
@@ -1599,6 +1583,15 @@ enum dupstring {
   STRING_LAST /* not used, just an end-of-list marker */
 };
 
+enum dupblob {
+  BLOB_CERT_ORIG,
+  BLOB_CERT_PROXY,
+  BLOB_KEY_ORIG,
+  BLOB_KEY_PROXY,
+  BLOB_SSL_ISSUERCERT_ORIG,
+  BLOB_LAST
+};
+
 /* callback that gets called when this easy handle is completed within a multi
    handle.  Only used for internally created transfers, like for example
    DoH. */
@@ -1730,6 +1723,7 @@ struct UserDefined {
   long new_directory_perms; /* Permissions to use when creating remote dirs */
   long ssh_auth_types;   /* allowed SSH auth types */
   char *str[STRING_LAST]; /* array of strings, pointing to allocated memory */
+  struct curl_blob *blobs[BLOB_LAST];
   unsigned int scope_id;  /* Scope id for IPv6 */
   long allowed_protocols;
   long redir_protocols;
