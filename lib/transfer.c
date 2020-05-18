@@ -128,12 +128,13 @@ static size_t Curl_trailers_read(char *buffer, size_t size, size_t nitems,
                                  void *raw)
 {
   struct Curl_easy *data = (struct Curl_easy *)raw;
-  Curl_send_buffer *trailers_buf = data->state.trailers_buf;
-  size_t bytes_left = trailers_buf->size_used-data->state.trailers_bytes_sent;
+  struct dynbuf *trailers_buf = &data->state.trailers_buf;
+  size_t bytes_left = Curl_dyn_len(trailers_buf) -
+    data->state.trailers_bytes_sent;
   size_t to_copy = (size*nitems < bytes_left) ? size*nitems : bytes_left;
   if(to_copy) {
     memcpy(buffer,
-           &trailers_buf->buffer[data->state.trailers_bytes_sent],
+           Curl_dyn_ptr(trailers_buf) + data->state.trailers_bytes_sent,
            to_copy);
     data->state.trailers_bytes_sent += to_copy;
   }
@@ -143,8 +144,8 @@ static size_t Curl_trailers_read(char *buffer, size_t size, size_t nitems,
 static size_t Curl_trailers_left(void *raw)
 {
   struct Curl_easy *data = (struct Curl_easy *)raw;
-  Curl_send_buffer *trailers_buf = data->state.trailers_buf;
-  return trailers_buf->size_used - data->state.trailers_bytes_sent;
+  struct dynbuf *trailers_buf = &data->state.trailers_buf;
+  return Curl_dyn_len(trailers_buf) - data->state.trailers_bytes_sent;
 }
 #endif
 
@@ -186,11 +187,8 @@ CURLcode Curl_fillreadbuffer(struct connectdata *conn, size_t bytes,
     infof(data,
           "Moving trailers state machine from initialized to sending.\n");
     data->state.trailers_state = TRAILERS_SENDING;
-    data->state.trailers_buf = Curl_add_buffer_init();
-    if(!data->state.trailers_buf) {
-      failf(data, "Unable to allocate trailing headers buffer !");
-      return CURLE_OUT_OF_MEMORY;
-    }
+    Curl_dyn_init(&data->state.trailers_buf, DYN_TRAILERS);
+
     data->state.trailers_bytes_sent = 0;
     Curl_set_in_callback(data, true);
     trailers_ret_code = data->set.trailer_callback(&trailers,
@@ -206,7 +204,7 @@ CURLcode Curl_fillreadbuffer(struct connectdata *conn, size_t bytes,
       result = CURLE_ABORTED_BY_CALLBACK;
     }
     if(result) {
-      Curl_add_buffer_free(&data->state.trailers_buf);
+      Curl_dyn_free(&data->state.trailers_buf);
       curl_slist_free_all(trailers);
       return result;
     }
@@ -369,7 +367,7 @@ CURLcode Curl_fillreadbuffer(struct connectdata *conn, size_t bytes,
 #ifndef CURL_DISABLE_HTTP
     if(data->state.trailers_state == TRAILERS_SENDING &&
        !Curl_trailers_left(data)) {
-      Curl_add_buffer_free(&data->state.trailers_buf);
+      Curl_dyn_free(&data->state.trailers_buf);
       data->state.trailers_state = TRAILERS_DONE;
       data->set.trailer_data = NULL;
       data->set.trailer_callback = NULL;
@@ -770,8 +768,9 @@ static CURLcode readwrite_data(struct Curl_easy *data,
       /* pass data to the debug function before it gets "dechunked" */
       if(data->set.verbose) {
         if(k->badheader) {
-          Curl_debug(data, CURLINFO_DATA_IN, data->state.headerbuff,
-                     (size_t)k->hbuflen);
+          Curl_debug(data, CURLINFO_DATA_IN,
+                     Curl_dyn_ptr(&data->state.headerb),
+                     Curl_dyn_len(&data->state.headerb));
           if(k->badheader == HEADER_PARTHEADER)
             Curl_debug(data, CURLINFO_DATA_IN,
                        k->str, (size_t)nread);
@@ -822,9 +821,9 @@ static CURLcode readwrite_data(struct Curl_easy *data,
 
       /* Account for body content stored in the header buffer */
       if((k->badheader == HEADER_PARTHEADER) && !k->ignorebody) {
-        DEBUGF(infof(data, "Increasing bytecount by %zu from hbuflen\n",
-                     k->hbuflen));
-        k->bytecount += k->hbuflen;
+        size_t headlen = Curl_dyn_len(&data->state.headerb);
+        DEBUGF(infof(data, "Increasing bytecount by %zu\n", headlen));
+        k->bytecount += headlen;
       }
 
       if((-1 != k->maxdownload) &&
@@ -858,15 +857,16 @@ static CURLcode readwrite_data(struct Curl_easy *data,
         if(k->badheader && !k->ignorebody) {
           /* we parsed a piece of data wrongly assuming it was a header
              and now we output it as body instead */
+          size_t headlen = Curl_dyn_len(&data->state.headerb);
 
           /* Don't let excess data pollute body writes */
-          if(k->maxdownload == -1 || (curl_off_t)k->hbuflen <= k->maxdownload)
+          if(k->maxdownload == -1 || (curl_off_t)headlen <= k->maxdownload)
             result = Curl_client_write(conn, CLIENTWRITE_BODY,
-                                       data->state.headerbuff,
-                                       k->hbuflen);
+                                       Curl_dyn_ptr(&data->state.headerb),
+                                       headlen);
           else
             result = Curl_client_write(conn, CLIENTWRITE_BODY,
-                                       data->state.headerbuff,
+                                       Curl_dyn_ptr(&data->state.headerb),
                                        (size_t)k->maxdownload);
 
           if(result)
@@ -1717,12 +1717,19 @@ CURLcode Curl_follow(struct Curl_easy *data,
     break;
 
   case 303: /* See Other */
-    /* Disable both types of POSTs, unless the user explicitly
-       asks for POST after POST */
-    if(data->set.httpreq != HTTPREQ_GET
-      && !(data->set.keep_post & CURL_REDIR_POST_303)) {
-      data->set.httpreq = HTTPREQ_GET; /* enforce GET request */
-      infof(data, "Disables POST, goes with %s\n",
+    /* 'See Other' location is not the resource but a substitute for the
+     * resource. In this case we switch the method to GET/HEAD, unless the
+     * method is POST and the user specified to keep it as POST.
+     * https://github.com/curl/curl/issues/5237#issuecomment-614641049
+     */
+    if(data->set.httpreq != HTTPREQ_GET &&
+       ((data->set.httpreq != HTTPREQ_POST &&
+         data->set.httpreq != HTTPREQ_POST_FORM &&
+         data->set.httpreq != HTTPREQ_POST_MIME) ||
+        !(data->set.keep_post & CURL_REDIR_POST_303))) {
+      data->set.httpreq = HTTPREQ_GET;
+      data->set.upload = false;
+      infof(data, "Switch to %s\n",
             data->set.opt_no_body?"HEAD":"GET");
     }
     break;
@@ -1837,15 +1844,21 @@ Curl_setup_transfer(
 {
   struct SingleRequest *k = &data->req;
   struct connectdata *conn = data->conn;
+  struct HTTP *http = data->req.protop;
+  bool httpsending = ((conn->handler->protocol&PROTO_FAMILY_HTTP) &&
+                      (http->sending == HTTPSEND_REQUEST));
   DEBUGASSERT(conn != NULL);
   DEBUGASSERT((sockindex <= 1) && (sockindex >= -1));
 
-  if(conn->bits.multiplex || conn->httpversion == 20) {
+  if(conn->bits.multiplex || conn->httpversion == 20 || httpsending) {
     /* when multiplexing, the read/write sockets need to be the same! */
     conn->sockfd = sockindex == -1 ?
       ((writesockindex == -1 ? CURL_SOCKET_BAD : conn->sock[writesockindex])) :
       conn->sock[sockindex];
     conn->writesockfd = conn->sockfd;
+    if(httpsending)
+      /* special and very HTTP-specific */
+      writesockindex = FIRSTSOCKET;
   }
   else {
     conn->sockfd = sockindex == -1 ?
@@ -1873,7 +1886,6 @@ Curl_setup_transfer(
       k->keepon |= KEEP_RECV;
 
     if(writesockindex != -1) {
-      struct HTTP *http = data->req.protop;
       /* HTTP 1.1 magic:
 
          Even if we require a 100-return code before uploading data, we might

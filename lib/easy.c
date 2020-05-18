@@ -77,6 +77,7 @@
 #include "http_digest.h"
 #include "system_win32.h"
 #include "http2.h"
+#include "dynbuf.h"
 
 /* The last 3 #include files should be in this order */
 #include "curl_printf.h"
@@ -680,6 +681,7 @@ static CURLcode easy_perform(struct Curl_easy *data, bool events)
   mcode = curl_multi_add_handle(multi, data);
   if(mcode) {
     curl_multi_cleanup(multi);
+    data->multi_easy = NULL;
     if(mcode == CURLM_OUT_OF_MEMORY)
       return CURLE_OUT_OF_MEMORY;
     return CURLE_FAILED_INIT;
@@ -762,6 +764,7 @@ static CURLcode dupset(struct Curl_easy *dst, struct Curl_easy *src)
 {
   CURLcode result = CURLE_OK;
   enum dupstring i;
+  enum dupblob j;
 
   /* Copy src->set into dst->set first, then deal with the strings
      afterwards */
@@ -774,6 +777,16 @@ static CURLcode dupset(struct Curl_easy *dst, struct Curl_easy *src)
   /* duplicate all strings */
   for(i = (enum dupstring)0; i< STRING_LASTZEROTERMINATED; i++) {
     result = Curl_setstropt(&dst->set.str[i], src->set.str[i]);
+    if(result)
+      return result;
+  }
+
+  /* clear all blob pointers first */
+  memset(dst->set.blobs, 0, BLOB_LAST * sizeof(struct curl_blob *));
+  /* duplicate all blobs */
+  for(j = (enum dupblob)0; j < BLOB_LAST; j++) {
+    result = Curl_setblobopt(&dst->set.blobs[j], src->set.blobs[j]);
+    /* Curl_setstropt return CURLE_BAD_FUNCTION_ARGUMENT with blob */
     if(result)
       return result;
   }
@@ -820,14 +833,11 @@ struct Curl_easy *curl_easy_duphandle(struct Curl_easy *data)
   if(!outcurl->state.buffer)
     goto fail;
 
-  outcurl->state.headerbuff = malloc(HEADERSIZE);
-  if(!outcurl->state.headerbuff)
-    goto fail;
-  outcurl->state.headersize = HEADERSIZE;
-
   /* copy all userdefined values */
   if(dupset(outcurl, data))
     goto fail;
+
+  Curl_dyn_init(&outcurl->state.headerb, CURL_MAX_HTTP_HEADER);
 
   /* the connection cache is setup on demand */
   outcurl->state.conn_cache = NULL;
@@ -921,7 +931,7 @@ struct Curl_easy *curl_easy_duphandle(struct Curl_easy *data)
     curl_slist_free_all(outcurl->change.cookielist);
     outcurl->change.cookielist = NULL;
     Curl_safefree(outcurl->state.buffer);
-    Curl_safefree(outcurl->state.headerbuff);
+    Curl_dyn_free(&outcurl->state.headerb);
     Curl_safefree(outcurl->change.url);
     Curl_safefree(outcurl->change.referer);
     Curl_freeset(outcurl);
@@ -1040,7 +1050,7 @@ CURLcode curl_easy_pause(struct Curl_easy *data, int action)
       /* copy the structs to allow for immediate re-pausing */
       for(i = 0; i < data->state.tempcount; i++) {
         writebuf[i] = data->state.tempwrite[i];
-        data->state.tempwrite[i].buf = NULL;
+        Curl_dyn_init(&data->state.tempwrite[i].b, DYN_PAUSE_BUFFER);
       }
       data->state.tempcount = 0;
 
@@ -1054,9 +1064,10 @@ CURLcode curl_easy_pause(struct Curl_easy *data, int action)
         /* even if one function returns error, this loops through and frees
            all buffers */
         if(!result)
-          result = Curl_client_write(conn, writebuf[i].type, writebuf[i].buf,
-                                     writebuf[i].len);
-        free(writebuf[i].buf);
+          result = Curl_client_write(conn, writebuf[i].type,
+                                     Curl_dyn_ptr(&writebuf[i].b),
+                                     Curl_dyn_len(&writebuf[i].b));
+        Curl_dyn_free(&writebuf[i].b);
       }
 
       /* recover previous owner of the connection */

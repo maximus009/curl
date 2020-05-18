@@ -46,6 +46,11 @@
 #include "multiif.h"
 #include "strerror.h"
 #include "curl_printf.h"
+
+#if defined(USE_WIN32_CRYPTO)
+#include <wincrypt.h>
+#endif
+
 #include <openssl/ssl.h>
 #include <openssl/rand.h>
 #include <openssl/x509v3.h>
@@ -210,11 +215,11 @@
 #define ENABLE_SSLKEYLOGFILE
 
 #ifdef ENABLE_SSLKEYLOGFILE
-typedef struct ssl_tap_state {
+struct ssl_tap_state {
   int master_key_length;
   unsigned char master_key[SSL_MAX_MASTER_KEY_LENGTH];
   unsigned char client_random[SSL3_RANDOM_SIZE];
-} ssl_tap_state_t;
+};
 #endif /* ENABLE_SSLKEYLOGFILE */
 
 struct ssl_backend_data {
@@ -224,7 +229,7 @@ struct ssl_backend_data {
   X509*    server_cert;
 #ifdef ENABLE_SSLKEYLOGFILE
   /* tap_state holds the last seen master key if we're logging them */
-  ssl_tap_state_t tap_state;
+  struct ssl_tap_state tap_state;
 #endif
 };
 
@@ -275,7 +280,7 @@ static void ossl_keylog_callback(const SSL *ssl, const char *line)
  * tap_ssl_key is called by libcurl to make the CLIENT_RANDOMs if the OpenSSL
  * being used doesn't have native support for doing that.
  */
-static void tap_ssl_key(const SSL *ssl, ssl_tap_state_t *state)
+static void tap_ssl_key(const SSL *ssl, struct ssl_tap_state *state)
 {
   const char *hex = "0123456789ABCDEF";
   int pos, i;
@@ -616,12 +621,136 @@ static bool is_pkcs11_uri(const char *string)
 static CURLcode Curl_ossl_set_engine(struct Curl_easy *data,
                                      const char *engine);
 
+static int
+SSL_CTX_use_certificate_bio(SSL_CTX *ctx, BIO *in, int type,
+                            const char *key_passwd)
+{
+  int ret = 0;
+  X509 *x = NULL;
+
+  if(type == SSL_FILETYPE_ASN1) {
+    /* j = ERR_R_ASN1_LIB; */
+    x = d2i_X509_bio(in, NULL);
+  }
+  else if(type == SSL_FILETYPE_PEM) {
+    /* ERR_R_PEM_LIB; */
+    x = PEM_read_bio_X509(in, NULL,
+                          passwd_callback, (void *)key_passwd);
+  }
+  else {
+    ret = 0;
+    goto end;
+  }
+
+  if(x == NULL) {
+    ret = 0;
+    goto end;
+  }
+
+  ret = SSL_CTX_use_certificate(ctx, x);
+ end:
+  X509_free(x);
+  return ret;
+}
+
+static int
+SSL_CTX_use_PrivateKey_bio(SSL_CTX *ctx, BIO* in, int type,
+                           const char *key_passwd)
+{
+  int ret = 0;
+  EVP_PKEY *pkey = NULL;
+
+  if(type == SSL_FILETYPE_PEM)
+    pkey = PEM_read_bio_PrivateKey(in, NULL, passwd_callback,
+                                   (void *)key_passwd);
+  else if(type == SSL_FILETYPE_ASN1)
+    pkey = d2i_PrivateKey_bio(in, NULL);
+  else {
+    ret = 0;
+    goto end;
+  }
+  if(pkey == NULL) {
+    ret = 0;
+    goto end;
+  }
+  ret = SSL_CTX_use_PrivateKey(ctx, pkey);
+  EVP_PKEY_free(pkey);
+  end:
+  return ret;
+}
+
+static int
+SSL_CTX_use_certificate_chain_bio(SSL_CTX *ctx, BIO* in,
+                                  const char *key_passwd)
+{
+/* SSL_CTX_add1_chain_cert introduced in OpenSSL 1.0.2 */
+#if (OPENSSL_VERSION_NUMBER >= 0x1000200fL) /* 1.0.2 or later */
+  int ret = 0;
+  X509 *x = NULL;
+  void *passwd_callback_userdata = (void *)key_passwd;
+
+  ERR_clear_error();
+
+  x = PEM_read_bio_X509_AUX(in, NULL,
+                            passwd_callback, (void *)key_passwd);
+
+  if(x == NULL) {
+    ret = 0;
+    goto end;
+  }
+
+  ret = SSL_CTX_use_certificate(ctx, x);
+
+  if(ERR_peek_error() != 0)
+      ret = 0;
+
+  if(ret) {
+    X509 *ca;
+    unsigned long err;
+
+    if(!SSL_CTX_clear_chain_certs(ctx)) {
+      ret = 0;
+      goto end;
+    }
+
+    while((ca = PEM_read_bio_X509(in, NULL, passwd_callback,
+                                  passwd_callback_userdata))
+          != NULL) {
+
+      if(!SSL_CTX_add0_chain_cert(ctx, ca)) {
+        X509_free(ca);
+        ret = 0;
+        goto end;
+      }
+    }
+
+    err = ERR_peek_last_error();
+    if((ERR_GET_LIB(err) == ERR_LIB_PEM) &&
+       (ERR_GET_REASON(err) == PEM_R_NO_START_LINE))
+      ERR_clear_error();
+    else
+      ret = 0;
+  }
+
+ end:
+  X509_free(x);
+  return ret;
+#else
+  (void)ctx; /* unused */
+  (void)in; /* unused */
+  (void)key_passwd; /* unused */
+  return 0;
+#endif
+}
+
 static
 int cert_stuff(struct connectdata *conn,
                SSL_CTX* ctx,
                char *cert_file,
+               BIO *cert_bio,
                const char *cert_type,
                char *key_file,
+               BIO* key_bio,
                const char *key_type,
                char *key_passwd)
 {
@@ -631,10 +760,11 @@ int cert_stuff(struct connectdata *conn,
 
   int file_type = do_file_type(cert_type);
 
-  if(cert_file || (file_type == SSL_FILETYPE_ENGINE)) {
+  if(cert_file || cert_bio || (file_type == SSL_FILETYPE_ENGINE)) {
     SSL *ssl;
     X509 *x509;
     int cert_done = 0;
+    int cert_use_result;
 
     if(key_passwd) {
       /* set the password in the callback userdata */
@@ -647,8 +777,10 @@ int cert_stuff(struct connectdata *conn,
     switch(file_type) {
     case SSL_FILETYPE_PEM:
       /* SSL_CTX_use_certificate_chain_file() only works on PEM files */
-      if(SSL_CTX_use_certificate_chain_file(ctx,
-                                            cert_file) != 1) {
+      cert_use_result = cert_bio ?
+          SSL_CTX_use_certificate_chain_bio(ctx, cert_bio, key_passwd) :
+          SSL_CTX_use_certificate_chain_file(ctx, cert_file);
+      if(cert_use_result != 1) {
         failf(data,
               "could not load PEM client certificate, " OSSL_PACKAGE
               " error %s, "
@@ -663,9 +795,12 @@ int cert_stuff(struct connectdata *conn,
       /* SSL_CTX_use_certificate_file() works with either PEM or ASN1, but
          we use the case above for PEM so this can only be performed with
          ASN1 files. */
-      if(SSL_CTX_use_certificate_file(ctx,
-                                      cert_file,
-                                      file_type) != 1) {
+
+      cert_use_result = cert_bio ?
+          SSL_CTX_use_certificate_bio(ctx, cert_bio,
+                                      file_type, key_passwd) :
+          SSL_CTX_use_certificate_file(ctx, cert_file, file_type);
+      if(cert_use_result != 1) {
         failf(data,
               "could not load ASN1 client certificate, " OSSL_PACKAGE
               " error %s, "
@@ -745,27 +880,31 @@ int cert_stuff(struct connectdata *conn,
       PKCS12 *p12 = NULL;
       EVP_PKEY *pri;
       STACK_OF(X509) *ca = NULL;
+      if(!cert_bio) {
+        fp = BIO_new(BIO_s_file());
+        if(fp == NULL) {
+          failf(data,
+                "BIO_new return NULL, " OSSL_PACKAGE
+                " error %s",
+                ossl_strerror(ERR_get_error(), error_buffer,
+                              sizeof(error_buffer)) );
+          return 0;
+        }
 
-      fp = BIO_new(BIO_s_file());
-      if(fp == NULL) {
-        failf(data,
-              "BIO_new return NULL, " OSSL_PACKAGE
-              " error %s",
-              ossl_strerror(ERR_get_error(), error_buffer,
-                            sizeof(error_buffer)) );
-        return 0;
+        if(BIO_read_filename(fp, cert_file) <= 0) {
+          failf(data, "could not open PKCS12 file '%s'", cert_file);
+          BIO_free(fp);
+          return 0;
+        }
       }
 
-      if(BIO_read_filename(fp, cert_file) <= 0) {
-        failf(data, "could not open PKCS12 file '%s'", cert_file);
+      p12 = d2i_PKCS12_bio(cert_bio ? cert_bio : fp, NULL);
+      if(fp)
         BIO_free(fp);
-        return 0;
-      }
-      p12 = d2i_PKCS12_bio(fp, NULL);
-      BIO_free(fp);
 
       if(!p12) {
-        failf(data, "error reading PKCS12 file '%s'", cert_file);
+        failf(data, "error reading PKCS12 file '%s'",
+              cert_bio ? "(memory blob)" : cert_file);
         return 0;
       }
 
@@ -846,8 +985,10 @@ int cert_stuff(struct connectdata *conn,
       return 0;
     }
 
-    if(!key_file)
+    if((!key_file) && (!key_bio)) {
       key_file = cert_file;
+      key_bio = cert_bio;
+    }
     else
       file_type = do_file_type(key_type);
 
@@ -857,9 +998,12 @@ int cert_stuff(struct connectdata *conn,
         break;
       /* FALLTHROUGH */
     case SSL_FILETYPE_ASN1:
-      if(SSL_CTX_use_PrivateKey_file(ctx, key_file, file_type) != 1) {
+      cert_use_result = key_bio ?
+        SSL_CTX_use_PrivateKey_bio(ctx, key_bio, file_type, key_passwd) :
+        SSL_CTX_use_PrivateKey_file(ctx, key_file, file_type);
+      if(cert_use_result != 1) {
         failf(data, "unable to set private key file: '%s' type %s",
-              key_file, key_type?key_type:"PEM");
+              key_file?key_file:"(memory blob)", key_type?key_type:"PEM");
         return 0;
       }
       break;
@@ -2413,6 +2557,7 @@ static CURLcode ossl_connect_step1(struct connectdata *conn, int sockindex)
   const enum CURL_TLSAUTH ssl_authtype = SSL_SET_OPTION(authtype);
 #endif
   char * const ssl_cert = SSL_SET_OPTION(cert);
+  const struct curl_blob *ssl_cert_blob = SSL_SET_OPTION(cert_blob);
   const char * const ssl_cert_type = SSL_SET_OPTION(cert_type);
   const char * const ssl_cafile = SSL_CONN_CONFIG(CAfile);
   const char * const ssl_capath = SSL_CONN_CONFIG(CApath);
@@ -2657,10 +2802,33 @@ static CURLcode ossl_connect_step1(struct connectdata *conn, int sockindex)
   }
 #endif
 
-  if(ssl_cert || ssl_cert_type) {
-    if(!cert_stuff(conn, backend->ctx, ssl_cert, ssl_cert_type,
-                   SSL_SET_OPTION(key), SSL_SET_OPTION(key_type),
-                   SSL_SET_OPTION(key_passwd))) {
+  if(ssl_cert || ssl_cert_blob || ssl_cert_type) {
+    BIO *ssl_cert_bio = NULL;
+    BIO *ssl_key_bio = NULL;
+    int result_cert_stuff;
+    if(ssl_cert_blob) {
+      /* the typecast of blob->len is fine since it is guaranteed to never be
+         larger than CURL_MAX_INPUT_LENGTH */
+      ssl_cert_bio = BIO_new_mem_buf(ssl_cert_blob->data,
+                                     (int)ssl_cert_blob->len);
+      if(!ssl_cert_bio)
+        return CURLE_SSL_CERTPROBLEM;
+    }
+    if(SSL_SET_OPTION(key_blob)) {
+      ssl_key_bio = BIO_new_mem_buf(SSL_SET_OPTION(key_blob)->data,
+                                    (int)SSL_SET_OPTION(key_blob)->len);
+      if(!ssl_key_bio)
+        return CURLE_SSL_CERTPROBLEM;
+    }
+    result_cert_stuff = cert_stuff(conn, backend->ctx,
+                   ssl_cert, ssl_cert_bio, ssl_cert_type,
+                   SSL_SET_OPTION(key), ssl_key_bio,
+                   SSL_SET_OPTION(key_type), SSL_SET_OPTION(key_passwd));
+    if(ssl_cert_bio)
+      BIO_free(ssl_cert_bio);
+    if(ssl_key_bio)
+      BIO_free(ssl_key_bio);
+    if(!result_cert_stuff) {
       /* failf() is already done in cert_stuff() */
       return CURLE_SSL_CERTPROBLEM;
     }
@@ -2720,31 +2888,184 @@ static CURLcode ossl_connect_step1(struct connectdata *conn, int sockindex)
   }
 #endif
 
+
+#if defined(USE_WIN32_CRYPTO)
+  /* Import certificates from the Windows root certificate store if requested.
+     https://stackoverflow.com/questions/9507184/
+     https://github.com/d3x0r/SACK/blob/master/src/netlib/ssl_layer.c#L1037
+     https://tools.ietf.org/html/rfc5280 */
+  if((SSL_CONN_CONFIG(verifypeer) || SSL_CONN_CONFIG(verifyhost)) &&
+     (SSL_SET_OPTION(native_ca_store))) {
+    X509_STORE *store = SSL_CTX_get_cert_store(backend->ctx);
+    HCERTSTORE hStore = CertOpenSystemStoreA((HCRYPTPROV_LEGACY)NULL, "ROOT");
+
+    if(hStore) {
+      PCCERT_CONTEXT pContext = NULL;
+      /* The array of enhanced key usage OIDs will vary per certificate and is
+         declared outside of the loop so that rather than malloc/free each
+         iteration we can grow it with realloc, when necessary. */
+      CERT_ENHKEY_USAGE *enhkey_usage = NULL;
+      DWORD enhkey_usage_size = 0;
+
+      /* This loop makes a best effort to import all valid certificates from
+         the MS root store. If a certificate cannot be imported it is skipped.
+         'result' is used to store only hard-fail conditions (such as out of
+         memory) that cause an early break. */
+      result = CURLE_OK;
+      for(;;) {
+        X509 *x509;
+        FILETIME now;
+        BYTE key_usage[2];
+        DWORD req_size;
+        const unsigned char *encoded_cert;
+#if defined(DEBUGBUILD) && !defined(CURL_DISABLE_VERBOSE_STRINGS)
+        char cert_name[256];
+#endif
+
+        pContext = CertEnumCertificatesInStore(hStore, pContext);
+        if(!pContext)
+          break;
+
+#if defined(DEBUGBUILD) && !defined(CURL_DISABLE_VERBOSE_STRINGS)
+        if(!CertGetNameStringA(pContext, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0,
+                               NULL, cert_name, sizeof(cert_name))) {
+          strcpy(cert_name, "Unknown");
+        }
+        infof(data, "SSL: Checking cert \"%s\"\n", cert_name);
+#endif
+
+        encoded_cert = (const unsigned char *)pContext->pbCertEncoded;
+        if(!encoded_cert)
+          continue;
+
+        GetSystemTimeAsFileTime(&now);
+        if(CompareFileTime(&pContext->pCertInfo->NotBefore, &now) > 0 ||
+           CompareFileTime(&now, &pContext->pCertInfo->NotAfter) > 0)
+          continue;
+
+        /* If key usage exists check for signing attribute */
+        if(CertGetIntendedKeyUsage(pContext->dwCertEncodingType,
+                                   pContext->pCertInfo,
+                                   key_usage, sizeof(key_usage))) {
+          if(!(key_usage[0] & CERT_KEY_CERT_SIGN_KEY_USAGE))
+            continue;
+        }
+        else if(GetLastError())
+          continue;
+
+        /* If enhanced key usage exists check for server auth attribute.
+         *
+         * Note "In a Microsoft environment, a certificate might also have EKU
+         * extended properties that specify valid uses for the certificate."
+         * The call below checks both, and behavior varies depending on what is
+         * found. For more details see CertGetEnhancedKeyUsage doc.
+         */
+        if(CertGetEnhancedKeyUsage(pContext, 0, NULL, &req_size)) {
+          if(req_size && req_size > enhkey_usage_size) {
+            void *tmp = realloc(enhkey_usage, req_size);
+
+            if(!tmp) {
+              failf(data, "SSL: Out of memory allocating for OID list");
+              result = CURLE_OUT_OF_MEMORY;
+              break;
+            }
+
+            enhkey_usage = (CERT_ENHKEY_USAGE *)tmp;
+            enhkey_usage_size = req_size;
+          }
+
+          if(CertGetEnhancedKeyUsage(pContext, 0, enhkey_usage, &req_size)) {
+            if(!enhkey_usage->cUsageIdentifier) {
+              /* "If GetLastError returns CRYPT_E_NOT_FOUND, the certificate is
+                 good for all uses. If it returns zero, the certificate has no
+                 valid uses." */
+              if(GetLastError() != CRYPT_E_NOT_FOUND)
+                continue;
+            }
+            else {
+              DWORD i;
+              bool found = false;
+
+              for(i = 0; i < enhkey_usage->cUsageIdentifier; ++i) {
+                if(!strcmp("1.3.6.1.5.5.7.3.1" /* OID server auth */,
+                           enhkey_usage->rgpszUsageIdentifier[i])) {
+                  found = true;
+                  break;
+                }
+              }
+
+              if(!found)
+                continue;
+            }
+          }
+          else
+            continue;
+        }
+        else
+          continue;
+
+        x509 = d2i_X509(NULL, &encoded_cert, pContext->cbCertEncoded);
+        if(!x509)
+          continue;
+
+        /* Try to import the certificate. This may fail for legitimate reasons
+           such as duplicate certificate, which is allowed by MS but not
+           OpenSSL. */
+        if(X509_STORE_add_cert(store, x509) == 1) {
+#if defined(DEBUGBUILD) && !defined(CURL_DISABLE_VERBOSE_STRINGS)
+          infof(data, "SSL: Imported cert \"%s\"\n", cert_name);
+#else
+          do {} while(0);
+#endif
+        }
+        X509_free(x509);
+      }
+
+      free(enhkey_usage);
+      CertFreeCertificateContext(pContext);
+      CertCloseStore(hStore, 0);
+
+      if(result)
+        return result;
+
+      infof(data, "successfully set certificate verify locations "
+            "to windows ca store\n");
+    }
+    else {
+      infof(data, "error setting certificate verify locations "
+            "to windows ca store, continuing anyway\n");
+    }
+  }
+  else
+#endif
+
 #if defined(OPENSSL_VERSION_MAJOR) && (OPENSSL_VERSION_MAJOR >= 3)
   /* OpenSSL 3.0.0 has deprecated SSL_CTX_load_verify_locations */
-  if(ssl_cafile) {
-    if(!SSL_CTX_load_verify_file(backend->ctx, ssl_cafile)) {
-      if(verifypeer) {
-        /* Fail if we insist on successfully verifying the server. */
-        failf(data, "error setting certificate file: %s", ssl_cafile);
-        return CURLE_SSL_CACERT_BADFILE;
+  {
+    if(ssl_cafile) {
+      if(!SSL_CTX_load_verify_file(backend->ctx, ssl_cafile)) {
+        if(verifypeer) {
+          /* Fail if we insist on successfully verifying the server. */
+          failf(data, "error setting certificate file: %s", ssl_cafile);
+          return CURLE_SSL_CACERT_BADFILE;
+        }
+        /* Continue with a warning if no certificate verif is required. */
+        infof(data, "error setting certificate file, continuing anyway\n");
       }
-      /* Continue with a warning if no certificate verification is required. */
-      infof(data, "error setting certificate file, continuing anyway\n");
+      infof(data, "  CAfile: %s\n", ssl_cafile);
     }
-    infof(data, "  CAfile: %s\n", ssl_cafile);
-  }
-  if(ssl_capath) {
-    if(!SSL_CTX_load_verify_dir(backend->ctx, ssl_capath)) {
-      if(verifypeer) {
-        /* Fail if we insist on successfully verifying the server. */
-        failf(data, "error setting certificate path: %s", ssl_capath);
-        return CURLE_SSL_CACERT_BADFILE;
+    if(ssl_capath) {
+      if(!SSL_CTX_load_verify_dir(backend->ctx, ssl_capath)) {
+        if(verifypeer) {
+          /* Fail if we insist on successfully verifying the server. */
+          failf(data, "error setting certificate path: %s", ssl_capath);
+          return CURLE_SSL_CACERT_BADFILE;
+        }
+        /* Continue with a warning if no certificate verif is required. */
+        infof(data, "error setting certificate path, continuing anyway\n");
       }
-      /* Continue with a warning if no certificate verification is required. */
-      infof(data, "error setting certificate path, continuing anyway\n");
+      infof(data, "  CApath: %s\n", ssl_capath);
     }
-    infof(data, "  CApath: %s\n", ssl_capath);
   }
 #else
   if(ssl_cafile || ssl_capath) {
@@ -2815,11 +3136,15 @@ static CURLcode ossl_connect_step1(struct connectdata *conn, int sockindex)
                          X509_V_FLAG_TRUSTED_FIRST);
 #endif
 #ifdef X509_V_FLAG_PARTIAL_CHAIN
-    if(!SSL_SET_OPTION(no_partialchain)) {
+    if(!SSL_SET_OPTION(no_partialchain) && !ssl_crlfile) {
       /* Have intermediate certificates in the trust store be treated as
          trust-anchors, in the same way as self-signed root CA certificates
          are. This allows users to verify servers using the intermediate cert
-         only, instead of needing the whole chain. */
+         only, instead of needing the whole chain.
+
+         Due to OpenSSL bug https://github.com/openssl/openssl/issues/5081 we
+         cannot do partial chains with CRL check.
+      */
       X509_STORE_set_flags(SSL_CTX_get_cert_store(backend->ctx),
                            X509_V_FLAG_PARTIAL_CHAIN);
     }
@@ -3552,27 +3877,32 @@ static CURLcode servercert(struct connectdata *conn,
        deallocating the certificate. */
 
     /* e.g. match issuer name with provided issuer certificate */
-    if(SSL_SET_OPTION(issuercert)) {
-      fp = BIO_new(BIO_s_file());
-      if(fp == NULL) {
-        failf(data,
-              "BIO_new return NULL, " OSSL_PACKAGE
-              " error %s",
-              ossl_strerror(ERR_get_error(), error_buffer,
-                            sizeof(error_buffer)) );
-        X509_free(backend->server_cert);
-        backend->server_cert = NULL;
-        return CURLE_OUT_OF_MEMORY;
-      }
+    if(SSL_SET_OPTION(issuercert) || SSL_SET_OPTION(issuercert_blob)) {
+      if(SSL_SET_OPTION(issuercert_blob))
+        fp = BIO_new_mem_buf(SSL_SET_OPTION(issuercert_blob)->data,
+                             (int)SSL_SET_OPTION(issuercert_blob)->len);
+      else {
+        fp = BIO_new(BIO_s_file());
+        if(fp == NULL) {
+          failf(data,
+                "BIO_new return NULL, " OSSL_PACKAGE
+                " error %s",
+                ossl_strerror(ERR_get_error(), error_buffer,
+                              sizeof(error_buffer)) );
+          X509_free(backend->server_cert);
+          backend->server_cert = NULL;
+          return CURLE_OUT_OF_MEMORY;
+        }
 
-      if(BIO_read_filename(fp, SSL_SET_OPTION(issuercert)) <= 0) {
-        if(strict)
-          failf(data, "SSL: Unable to open issuer cert (%s)",
-                SSL_SET_OPTION(issuercert));
-        BIO_free(fp);
-        X509_free(backend->server_cert);
-        backend->server_cert = NULL;
-        return CURLE_SSL_ISSUER_ERROR;
+        if(BIO_read_filename(fp, SSL_SET_OPTION(issuercert)) <= 0) {
+          if(strict)
+            failf(data, "SSL: Unable to open issuer cert (%s)",
+                  SSL_SET_OPTION(issuercert));
+          BIO_free(fp);
+          X509_free(backend->server_cert);
+          backend->server_cert = NULL;
+          return CURLE_SSL_ISSUER_ERROR;
+        }
       }
 
       issuer = PEM_read_bio_X509(fp, NULL, ZERO_NULL, NULL);

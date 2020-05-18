@@ -34,7 +34,6 @@ pr:
   branches:
     include:
     - 'master'
-    - '*/ci'
 
 stages:
 
@@ -183,7 +182,7 @@ stages:
   jobs:
   - job: windows_msys2_mingw32_debug_openssl
     displayName: msys2 mingw32 debug openssl
-    timeoutInMinutes: 70
+    timeoutInMinutes: 90
     pool:
       vmImage: 'windows-2019'
     container:
@@ -206,7 +205,7 @@ stages:
 
   - job: windows_msys2_mingw64_debug_openssl
     displayName: msys2 mingw64 debug openssl
-    timeoutInMinutes: 70
+    timeoutInMinutes: 90
     pool:
       vmImage: 'windows-2019'
     container:
@@ -229,7 +228,7 @@ stages:
 
   - job: windows_msys1_mingw_debug_openssl
     displayName: msys1 mingw debug openssl
-    timeoutInMinutes: 70
+    timeoutInMinutes: 90
     pool:
       vmImage: 'windows-2019'
     container:
@@ -249,13 +248,13 @@ stages:
 
   - job: windows_msys1_mingw32_debug_openssl
     displayName: msys1 mingw32 debug openssl
-    timeoutInMinutes: 70
+    timeoutInMinutes: 90
     pool:
       vmImage: 'windows-2019'
     container:
       image: mback2k/curl-docker-winbuildenv-msys1-mingw32:ltsc2019
     steps:
-    - script: C:\MinGW\msys\1.0\bin\sh -l -c "cd $(echo '%cd%') && ./buildconf && ./configure --host=i686-w64-mingw32 --build=i686-w64-mingw32 --prefix=/mingw32 --enable-debug --enable-werror --without-zlib"
+    - script: C:\MinGW\msys\1.0\bin\sh -l -c "cd $(echo '%cd%') && ./buildconf && ./configure --host=i686-w64-mingw32 --build=i686-w64-mingw32 --prefix=/mingw32 --enable-debug --enable-werror --without-zlib --enable-mqtt"
       displayName: 'configure debug without zlib'
 
     - script: C:\MinGW\msys\1.0\bin\sh -l -c "cd $(echo '%cd%') && make"
@@ -269,7 +268,7 @@ stages:
 
   - job: windows_msys1_mingw64_debug_openssl
     displayName: msys1 mingw64 debug openssl
-    timeoutInMinutes: 70
+    timeoutInMinutes: 90
     pool:
       vmImage: 'windows-2019'
     container:
@@ -289,7 +288,7 @@ stages:
 
   - job: windows_msys2_mingw32_debug_schannel
     displayName: msys2 mingw32 debug schannel
-    timeoutInMinutes: 70
+    timeoutInMinutes: 90
     pool:
       vmImage: 'windows-2019'
     container:
@@ -312,7 +311,7 @@ stages:
 
   - job: windows_msys2_mingw64_debug_schannel
     displayName: msys2 mingw64 debug schannel
-    timeoutInMinutes: 70
+    timeoutInMinutes: 90
     pool:
       vmImage: 'windows-2019'
     container:
@@ -335,7 +334,7 @@ stages:
 
   - job: windows_msys1_mingw_debug_schannel
     displayName: msys1 mingw debug schannel
-    timeoutInMinutes: 70
+    timeoutInMinutes: 90
     pool:
       vmImage: 'windows-2019'
     container:
@@ -355,7 +354,7 @@ stages:
 
   - job: windows_msys1_mingw32_debug_schannel
     displayName: msys1 mingw32 debug schannel
-    timeoutInMinutes: 70
+    timeoutInMinutes: 90
     pool:
       vmImage: 'windows-2019'
     container:
@@ -375,7 +374,7 @@ stages:
 
   - job: windows_msys1_mingw64_debug_schannel
     displayName: msys1 mingw64 debug schannel
-    timeoutInMinutes: 70
+    timeoutInMinutes: 90
     pool:
       vmImage: 'windows-2019'
     container:

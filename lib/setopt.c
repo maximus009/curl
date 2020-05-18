@@ -77,6 +77,37 @@ CURLcode Curl_setstropt(char **charp, const char *s)
   return CURLE_OK;
 }
 
+CURLcode Curl_setblobopt(struct curl_blob **blobp,
+                         const struct curl_blob *blob)
+{
+  /* free the previous storage at `blobp' and replace by a dynamic storage
+     copy of blob. If CURL_BLOB_COPY is set, the data is copied. */
+
+  Curl_safefree(*blobp);
+
+  if(blob) {
+    struct curl_blob *nblob;
+    if(blob->len > CURL_MAX_INPUT_LENGTH)
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    nblob = (struct curl_blob *)
+      malloc(sizeof(struct curl_blob) +
+             ((blob->flags & CURL_BLOB_COPY) ? blob->len : 0));
+    if(!nblob)
+      return CURLE_OUT_OF_MEMORY;
+    *nblob = *blob;
+    if(blob->flags & CURL_BLOB_COPY) {
+      /* put the data after the blob struct in memory */
+      nblob->data = (char *)nblob + sizeof(struct curl_blob);
+      memcpy(nblob->data, blob->data, blob->len);
+    }
+
+    *blobp = nblob;
+    return CURLE_OK;
+  }
+
+  return CURLE_OK;
+}
+
 static CURLcode setstropt_userpwd(char *option, char **userp, char **passwdp)
 {
   CURLcode result = CURLE_OK;
@@ -1606,6 +1637,13 @@ CURLcode Curl_vsetopt(struct Curl_easy *data, CURLoption option, va_list param)
     result = Curl_setstropt(&data->set.str[STRING_CERT_ORIG],
                             va_arg(param, char *));
     break;
+  case CURLOPT_SSLCERT_BLOB:
+    /*
+     * Blob that holds file name of the SSL certificate to use
+     */
+    result = Curl_setblobopt(&data->set.blobs[BLOB_CERT_ORIG],
+                             va_arg(param, struct curl_blob *));
+    break;
 #ifndef CURL_DISABLE_PROXY
   case CURLOPT_PROXY_SSLCERT:
     /*
@@ -1613,6 +1651,13 @@ CURLcode Curl_vsetopt(struct Curl_easy *data, CURLoption option, va_list param)
      */
     result = Curl_setstropt(&data->set.str[STRING_CERT_PROXY],
                             va_arg(param, char *));
+    break;
+  case CURLOPT_PROXY_SSLCERT_BLOB:
+    /*
+     * Blob that holds file name of the SSL certificate to use for proxy
+     */
+    result = Curl_setblobopt(&data->set.blobs[BLOB_CERT_PROXY],
+                             va_arg(param, struct curl_blob *));
     break;
 #endif
   case CURLOPT_SSLCERTTYPE:
@@ -1638,6 +1683,13 @@ CURLcode Curl_vsetopt(struct Curl_easy *data, CURLoption option, va_list param)
     result = Curl_setstropt(&data->set.str[STRING_KEY_ORIG],
                             va_arg(param, char *));
     break;
+  case CURLOPT_SSLKEY_BLOB:
+    /*
+     * Blob that holds file name of the SSL key to use
+     */
+    result = Curl_setblobopt(&data->set.blobs[BLOB_KEY_ORIG],
+                             va_arg(param, struct curl_blob *));
+    break;
 #ifndef CURL_DISABLE_PROXY
   case CURLOPT_PROXY_SSLKEY:
     /*
@@ -1645,6 +1697,13 @@ CURLcode Curl_vsetopt(struct Curl_easy *data, CURLoption option, va_list param)
      */
     result = Curl_setstropt(&data->set.str[STRING_KEY_PROXY],
                             va_arg(param, char *));
+    break;
+  case CURLOPT_PROXY_SSLKEY_BLOB:
+    /*
+     * Blob that holds file name of the SSL key to use for proxy
+     */
+    result = Curl_setblobopt(&data->set.blobs[BLOB_KEY_PROXY],
+                             va_arg(param, struct curl_blob *));
     break;
 #endif
   case CURLOPT_SSLKEYTYPE:
@@ -1970,6 +2029,13 @@ CURLcode Curl_vsetopt(struct Curl_easy *data, CURLoption option, va_list param)
     result = Curl_setstropt(&data->set.str[STRING_SSL_ISSUERCERT_ORIG],
                             va_arg(param, char *));
     break;
+  case CURLOPT_ISSUERCERT_BLOB:
+    /*
+     * Blob that holds Issuer certificate to check certificates issuer
+     */
+    result = Curl_setblobopt(&data->set.blobs[BLOB_SSL_ISSUERCERT_ORIG],
+                             va_arg(param, struct curl_blob *));
+    break;
 #ifndef CURL_DISABLE_TELNET
   case CURLOPT_TELNETOPTIONS:
     /*
@@ -2135,6 +2201,7 @@ CURLcode Curl_vsetopt(struct Curl_easy *data, CURLoption option, va_list param)
     data->set.ssl.no_revoke = !!(arg & CURLSSLOPT_NO_REVOKE);
     data->set.ssl.no_partialchain = !!(arg & CURLSSLOPT_NO_PARTIALCHAIN);
     data->set.ssl.revoke_best_effort = !!(arg & CURLSSLOPT_REVOKE_BEST_EFFORT);
+    data->set.ssl.native_ca_store = !!(arg & CURLSSLOPT_NATIVE_CA);
     break;
 
 #ifndef CURL_DISABLE_PROXY
@@ -2144,6 +2211,7 @@ CURLcode Curl_vsetopt(struct Curl_easy *data, CURLoption option, va_list param)
       (bool)((arg&CURLSSLOPT_ALLOW_BEAST) ? TRUE : FALSE);
     data->set.proxy_ssl.no_revoke = !!(arg & CURLSSLOPT_NO_REVOKE);
     data->set.proxy_ssl.no_partialchain = !!(arg & CURLSSLOPT_NO_PARTIALCHAIN);
+    data->set.proxy_ssl.native_ca_store = !!(arg & CURLSSLOPT_NATIVE_CA);
     data->set.proxy_ssl.revoke_best_effort =
       !!(arg & CURLSSLOPT_REVOKE_BEST_EFFORT);
     break;
